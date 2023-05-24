@@ -1,0 +1,195 @@
+#!/bin/bash
+# lvm2pbs 0.1
+# Copyright (c) 2023, Przemyslaw Kwiatkowski
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+## CONFIGURATION
+
+# You might need some or all of these variables as described in Proxmox Backup Client documentation.
+# Remember to export them!
+#export PBS_REPOSITORY=
+#export PBS_FINGERPRINT=
+#export PBS_PASSWORD=
+#export PBS_ENCRYPTION_PASSWORD=
+
+# You might want to add extra options to the proxmox-backup-client (see the man page)
+#EXTRA_OPTS="--keyfile /path/to/encryption-key.json --ns MyNS --backup-id mybackup1"
+
+# Use static snapshot name. (Not recommended!)
+#SNAPSHOT_NAME=mysnap
+
+# The snapshot must be large enough to accommodate all the changes made to the lv during the lifespan of the snapshot.
+# As the backup process needs the snaposhot only for a very limited time - generally this number might be low.
+# Default setting of "10%ORIGIN" is most likely way to high. Decrease it if you have not enough free extents in vg.
+#SNAPSHOT_SIZE=10%ORIGIN
+
+#
+# Do not edit beyond this point. :-)
+
+function help {
+cat >&2 <<EOF
+
+USAGE: [1]   lvm2pbs archivename.img  my_vg/lv_name
+       [2]   lvm2pbs archivename.pxar my_vg/lv_name [fstype]
+
+This wrapper script creates temporary snapshot of a logical volume, sends it to
+Proxmox Backup Server and finally destroys the snapshot.
+The content of lv might be stored as raw image [1] or as filessytem archive [2].
+In 2nd case the snapshot is automatically mounted before backup and unmounted after.
+
+This script should be run as root (or via sudo, or possibly via sudo -E).
+EOF
+exit 255
+}
+
+
+function discover_names() {
+    set $(lvs --noheadings -o lv_name,vg_name "$1" 2>/dev/null) >/dev/null
+    LV=$1
+    VG=$2
+}
+
+function create_tmpdir() {
+    TMP_DIR=$(mktemp -d -t lvm2pbs-XXXXXXXXXX)
+    if [ ! -d "$TMP_DIR" ]; then
+	echo "Error: unable to create tmpdir." >&2
+	return 1
+    fi
+}
+
+function create_snapshot() {
+    if ( lvcreate "-l$SNAPSHOT_SIZE" -s -n "$SNAPSHOT_NAME" "$VG/$LV" 2>/dev/null); then
+	return 0
+    else
+	echo "Failed to create snapshot." >&2
+	return 1
+    fi
+}
+
+function destroy_snapshot() {
+    if ( lvremove -y "$VG/$SNAPSHOT_NAME" 2>/dev/null); then
+	return 0
+    else
+	echo "Failed to destroy snapshot." >&2
+	return 1
+    fi
+}
+
+function mount_snapshot() {
+    if ( mount "/dev/$VG/$SNAPSHOT_NAME" "$TMP_DIR" -o ro -t "$FS" ); then
+	return 0
+    else
+	echo "Failed to mount snapshot." >&2
+	return 1
+    fi
+}
+
+function umount_snapshot() {
+    if ( umount -f "$TMP_DIR" ); then
+	return 0
+    else
+	echo "Failed to umount snapshot." >&2
+	return 1
+    fi
+}
+
+
+
+echo "lvm2pbs - LVM backup made easy" >&2
+[ "$#" -eq 0 ] && help
+
+NECESSARY_EXECUTABLES="echo date mktemp lvs lvcreate lvremove mount umount proxmox-backup-client"
+if ! which $NECESSARY_EXECUTABLES >/dev/null 2>&1; then
+    echo "Missing binaries!" >&2
+    echo "Make sure these tools are available: $NECESSARY_EXECUTABLES" >&2
+    exit 255
+fi
+
+[ -z "$SNAPSHOT_NAME" ] && SNAPSHOT_NAME=`date +lvm2pbs%s`
+[ -z "$SNAPSHOT_SIZE" ] && SNAPSHOT_SIZE=10%ORIGIN
+
+ARCHIVE_NAME="$1"
+if [[ "$ARCHIVE_NAME" == *.pxar ]]; then
+    RAW_IMAGE=NO
+elif [[ "$ARCHIVE_NAME" == *.img ]]; then
+    RAW_IMAGE=YES
+else
+    echo "Unknown archive type: $ARCHIVE_NAME" >&2
+    exit 1
+fi
+
+discover_names "$2"
+if [ -z "$VG" ]; then
+    echo "Unable to find volume group." >&2
+    exit 1
+fi
+if [ -z "$LV" ]; then
+    echo "Unable to find logical volume." >&2
+    exit 1
+fi
+
+
+if [ "$RAW_IMAGE" == "NO" ]; then
+    FS="$3"
+    [ -z "$FS" ] && FS=auto
+
+    create_tmpdir || exit 1
+    create_snapshot || exit 1
+    mount_snapshot || (umount_snapshot; destroy_snapshot; exit 1)
+
+    echo "[calling proxmox-backup-client]" >&2
+    if ( proxmox-backup-client backup $EXTRA_OPTS "$ARCHIVE_NAME:$TMP_DIR" ); then
+	echo "[proxmox-backup-client done]" >&2
+	FAILED=0
+    else
+	echo "[proxmox-backup-client FAILED]" >&2
+	FAILED=1
+    fi
+
+    sleep 1
+    umount_snapshot
+    destroy_snapshot
+    rm -d "$TMP_DIR"
+    exit $FAILED
+elif [ "$RAW_IMAGE" == "YES" ]; then
+    create_snapshot || exit 1
+
+    echo "[calling proxmox-backup-client]" >&2
+    if ( proxmox-backup-client backup $EXTRA_OPTS "$ARCHIVE_NAME:/dev/$VG/$SNAPSHOT_NAME" ); then
+	echo "[proxmox-backup-client done]" >&2
+	FAILED=0
+    else
+	echo "[proxmox-backup-client FAILED]" >&2
+	FAILED=1
+    fi
+
+    sleep 1
+    destroy_snapshot
+    exit $FAILED
+fi
